@@ -1,0 +1,47 @@
+{
+  "strategy": "MomentumIgnition",
+  "assets": [
+    "ES"
+  ],
+  "split": "train",
+  "saved_at": "20260325_143332",
+  "params": {
+    "multi_lot": true,
+    "lot1_size": 1,
+    "lot1_tp_points": 1.8,
+    "lot1_exit_modes": "fixed",
+    "lot1_stop_mode": "none",
+    "lot2_size": 1,
+    "lot2_exit_modes": "ema_flip,time_exit",
+    "lot2_tp_points": 0.0,
+    "runner_activation_atr": 1.2,
+    "lot2_stop_mode": "breakeven",
+    "lot3_size": 0,
+    "lot3_tp_points": 0.0,
+    "lot3_stop_mode": "breakeven",
+    "lot3_exit_modes": "ema_flip,time_exit",
+    "runner_ema_fast": 9,
+    "runner_ema_slow": 21,
+    "runner_time_bars": 120,
+    "flag_bars": 8,
+    "compression_atr_mult": 1.5,
+    "atr_period_1m": 14,
+    "atr_period_15m": 14,
+    "atr_sma_period_15m": 50,
+    "stop_buf_atr": 0.1,
+    "min_stop_ticks": 4,
+    "target_points": 3.5,
+    "time_exit_bars": 60,
+    "entry_gap_ticks": 4,
+    "direction": "both",
+    "timeframe": "1m"
+  },
+  "metrics": {
+    "profit_factor": 0.7406,
+    "num_trades": 1806,
+    "total_pnl": -58248.0,
+    "win_rate": 0.6141,
+    "sharpe": -4.7728,
+    "max_drawdown": -61454.5
+  }
+}
