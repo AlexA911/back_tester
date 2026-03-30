@@ -32,7 +32,8 @@ import numpy as np
 import pandas as pd
 
 from datasets import DATASETS
-from backtest import run_backtest, load_data
+from backtest import run_backtest
+from cache_manager import load_cached, load_raw, get_split_date, load_resampled_cache
 from strategy import Strategy
 
 
@@ -66,6 +67,9 @@ def _run_combo(
     trade_size: int,
     commission: float,
     cached_data: dict[str, pd.DataFrame],
+    datasets_override: dict | None = None,
+    worker_meta: dict | None = None,
+    use_mp: bool = False,
 ) -> dict[str, Any]:
     """
     Run one param combination across all assets.
@@ -75,7 +79,16 @@ def _run_combo(
     per_asset = {}
 
     for key in assets:
-        dataset = DATASETS[key]
+        dataset = (datasets_override or {}).get(key) or DATASETS.get(key, {})
+
+        # Inject pre-resampled signal bars
+        # In single-process mode: use in-memory cached_data directly
+        # In MP mode: reload from cache file (avoids pickling large DataFrames)
+        _params = dict(params)
+        # Note: _presampled_sig injection removed — strategy resamples from
+        # df_1m which is already correctly date-filtered by backtest.py.
+        # The 120m cache is still built for future optimisation but not injected.
+        params_for_run = _params
 
         # Derive effective trade_size for multi-lot
         multi_lot = params.get("multi_lot", False)
@@ -92,7 +105,7 @@ def _run_combo(
 
         result = run_backtest(
             dataset=dataset,
-            strategy=strategy_class(params=params),
+            strategy=strategy_class(params=params_for_run),
             split=split,
             trade_size=effective_size,
             commission_per_side=commission,
@@ -169,6 +182,7 @@ def run_grid_search(
     commission: float = 2.0,
     rank_by: str = "profit_factor",
     min_trades: int = 30,
+    datasets_override: dict | None = None,
 ) -> dict[str, Any]:
     """
     Run an exhaustive grid search over all parameter combinations.
@@ -199,20 +213,99 @@ def run_grid_search(
     print()
 
     # Pre-load all data once — avoid re-reading CSVs on every combo
+    # Uses cache where available for speed; falls back to raw CSV
     print("  Loading data...", end=" ", flush=True)
     cached_data = {}
     skipped = []
     for key in assets:
-        dataset = DATASETS.get(key, {})
-        path    = dataset.get(split)
+        dataset    = (datasets_override or {}).get(key) or DATASETS.get(key, {})
         tick_size  = dataset.get("tick_size")
         tick_value = dataset.get("tick_value")
 
-        if not path or not tick_size or not tick_value:
+        if not tick_size or not tick_value:
             skipped.append(key)
             continue
+
+        full_path = dataset.get("full")
+        raw_path  = dataset.get(split) or full_path
+        if not raw_path:
+            skipped.append(key)
+            continue
+
         try:
-            cached_data[key] = load_data(path, dataset["date_format"])
+            from pathlib import Path as _Path
+            period = dataset.get("period")
+
+            if full_path and _Path(full_path).exists():
+                # Full CSV available — use cache (auto-build on first run)
+                # build_cache writes split_date to index synchronously,
+                # so get_split_date is always valid after this call returns
+                df = load_cached(
+                    symbol=key,
+                    timeframe=1,
+                    raw_path=full_path,
+                    date_format=dataset["date_format"],
+                    auto_build=True,
+                    verbose=True,
+                )
+                # Apply date filter — split_date now guaranteed in index
+                if period is not None:
+                    from_date, to_date = period
+                    if from_date:
+                        df = df[df.index >= pd.Timestamp(from_date)]
+                    if to_date:
+                        df = df[df.index <= pd.Timestamp(to_date)]
+                elif split in ("train", "test"):
+                    split_date = dataset.get("split_date") or get_split_date(key)
+                    if split_date:
+                        if split == "train":
+                            df = df[df.index < pd.Timestamp(split_date)]
+                        else:
+                            df = df[df.index >= pd.Timestamp(split_date)]
+                    else:
+                        # Should never happen — build_cache always stores split_date
+                        raise RuntimeError(f"No split_date for {key} after cache build")
+            else:
+                # No full CSV — fall back to split-specific CSV (original behaviour)
+                # train CSV = train data, test CSV = test data — always correct
+                if period is not None:
+                    load_path = raw_path
+                    df = load_raw(load_path, dataset["date_format"])
+                    from_date, to_date = period
+                    if from_date:
+                        df = df[df.index >= pd.Timestamp(from_date)]
+                    if to_date:
+                        df = df[df.index <= pd.Timestamp(to_date)]
+                else:
+                    df = load_raw(raw_path, dataset["date_format"])
+
+            # If strategy has a fixed signal timeframe, pre-resample and cache
+            # FGBLMomentum always uses 120m signal bars with 15min offset
+            # Pre-computing this once per asset saves ~28s per combo
+            strategy_tf = None
+            if hasattr(strategy_class, "manages_own_lots") and strategy_class.manages_own_lots:
+                # Check if all combos use the same signal_minutes/offset
+                sig_mins = param_grid.get("signal_minutes", [120])
+                off_mins = param_grid.get("anchor_offset_minutes", [15])
+                if len(set(sig_mins)) == 1 and len(set(off_mins)) == 1:
+                    strategy_tf = int(sig_mins[0])
+                    offset_min  = int(off_mins[0])
+                    sig_df = load_resampled_cache(
+                        symbol=key,
+                        timeframe=strategy_tf,
+                        df_1m=df,
+                        offset_min=offset_min,
+                        verbose=True,
+                    )
+                    # Store FULL sig_df — apply split filter at injection time
+                    # so the same cache works for both train and test runs
+                    cached_data[f"{key}_sig"] = sig_df
+                    cached_data[f"{key}_sig_meta"] = {
+                        "split_date": dataset.get("split_date") or get_split_date(key),
+                        "period":     dataset.get("period"),
+                    }
+
+            cached_data[key] = df
         except Exception as e:
             print(f"\n  WARNING: Could not load {key}: {e}")
             skipped.append(key)
@@ -221,9 +314,28 @@ def run_grid_search(
     print(f"loaded {len(runnable)} asset(s)."
           + (f" Skipped: {skipped}" if skipped else ""))
 
-    # Run all combinations — use multiprocessing if >1 combo, else single-process
+    # Run all combinations
+    # Use multiprocessing ONLY when cached_data is small (no large DataFrames)
+    # Large DataFrames get pickled per-worker which is slower than single-process
     n_cores = max(1, os.cpu_count() or 1)
-    use_mp  = total > 1 and n_cores > 1
+    # Estimate cached data size — if >50MB, single process is faster
+    _cache_size_mb = sum(
+        df.memory_usage(deep=True).sum() / 1e6
+        for df in cached_data.values()
+        if hasattr(df, "memory_usage")
+    )
+    use_mp = total > 1 and n_cores > 1 and _cache_size_mb < 50
+
+    # Build lightweight metadata for workers — no DataFrames in pickle
+    # Workers reload pre-resampled data from cache files directly
+    worker_meta = {
+        key: {
+            "has_sig_cache": f"{key}_sig" in cached_data,
+            "sig_timeframe": 120,  # always 120m for FGBLMomentum
+            "offset_min":    int(list(param_grid.get("anchor_offset_minutes", [15]))[0]),
+        }
+        for key in runnable
+    }
 
     _worker = partial(
         _run_combo,
@@ -233,6 +345,7 @@ def run_grid_search(
         trade_size=trade_size,
         commission=commission,
         cached_data=cached_data,
+        datasets_override=datasets_override,
     )
 
     all_results = []
@@ -272,8 +385,9 @@ def run_grid_search(
             continue
         if agg["num_trades"] < min_trades:
             continue
+        clean_p = {k: v for k, v in r["params"].items() if not k.startswith("_")}
         shared.append({
-            **r["params"],
+            **clean_p,
             "total_pnl":     agg["total_pnl"],
             "num_trades":    agg["num_trades"],
             "profit_factor": agg["profit_factor"],
@@ -293,7 +407,16 @@ def run_grid_search(
             params_str = ", ".join(f"{k}={v}" for k, v in r["params"].items()
                                    if k not in ("timeframe",))[:80]
             if "error" in agg:
-                print(f"    Error: {agg['error']}  [{params_str}]")
+                # Also show per-asset errors for diagnosis
+                per = r.get("per_asset", {})
+                for asset_key, asset_result in per.items():
+                    if "error" in asset_result:
+                        print(f"    {asset_key}: {asset_result['error']}")
+                    else:
+                        n = asset_result.get("num_trades", 0)
+                        bars = asset_result.get("bars_1m", 0)
+                        print(f"    {asset_key}: {n} trades, {bars:,} 1m bars")
+                print(f"    Aggregate error: {agg['error']}  [{params_str}]")
             else:
                 n = agg.get("num_trades", 0)
                 print(f"    {n} trades (min={min_trades})  [{params_str}]")
@@ -323,7 +446,7 @@ def run_grid_search(
             if asset_result.get("num_trades", 0) < min_trades:
                 continue
             rows.append({
-                **r["params"],
+                **{k: v for k, v in r["params"].items() if not k.startswith("_")},
                 "total_pnl":     asset_result["total_pnl"],
                 "num_trades":    asset_result["num_trades"],
                 "profit_factor": asset_result["profit_factor"],
@@ -338,10 +461,42 @@ def run_grid_search(
             df.index += 1
             per_asset_best[key] = df
 
+    # ------------------------------------------------------------------
+    # Parameter influence analysis
+    # For each swept parameter, measure how much PF varies when only
+    # that parameter changes (marginal effect across all combos)
+    # ------------------------------------------------------------------
+    influence = {}
+    swept_params = {k: v for k, v in param_grid.items()
+                    if len(v) > 1 and not k.startswith("_")}
+
+    if not shared_df.empty and swept_params:
+        for param in swept_params:
+            if param not in shared_df.columns:
+                continue
+            # Group by this param value, get mean PF for each value
+            try:
+                pf_by_val = shared_df.groupby(param)["profit_factor"].mean()
+                pf_variance = float(pf_by_val.var()) if len(pf_by_val) > 1 else 0.0
+                pf_range    = float(pf_by_val.max() - pf_by_val.min())
+                pf_mean     = float(pf_by_val.mean()) if pf_by_val.mean() != 0 else 1.0
+                # Relative range: how much does PF change as % of mean PF
+                relative_range = pf_range / abs(pf_mean) if pf_mean != 0 else 0.0
+                influence[param] = {
+                    "pf_variance":     round(pf_variance, 6),
+                    "pf_range":        round(pf_range, 4),
+                    "relative_range":  round(relative_range, 4),
+                    "values_tested":   [str(v) for v in swept_params[param]],
+                    "influential":     relative_range > 0.01,  # >1% PF range = influential
+                }
+            except Exception:
+                pass
+
     return {
         "all_results":    all_results,
         "shared_ranking": shared_df,
         "per_asset_best": per_asset_best,
+        "influence":      influence,
         "summary": {
             "strategy":    strategy_class.__name__,
             "param_grid":  param_grid,

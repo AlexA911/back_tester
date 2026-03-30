@@ -22,6 +22,7 @@ import pandas as pd
 from strategy import Strategy
 from engine import simulate_trades, simulate_trades_multilot, simulate_trades_fgbl, calculate_metrics
 from resampler import resample_ohlcv
+from cache_manager import load_cached, load_raw, get_split_date
 
 
 # ---------------------------------------------------------------------------
@@ -31,42 +32,9 @@ from resampler import resample_ohlcv
 def load_data(path: str, date_format: str) -> pd.DataFrame:
     """
     Load a CSV into a standardised 1m OHLCV DataFrame.
-
-    Handles column format:
-        Open, High, Low, Close, Volume, BidAskSpread, Time, ...
-    Extra columns silently dropped.
-    ISO datetime strings handled automatically alongside original format.
+    Delegates to cache_manager.load_raw for consistency.
     """
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    for candidate in ("time", "datetime", "timestamp", "date"):
-        if candidate in df.columns:
-            df.rename(columns={candidate: "date"}, inplace=True)
-            break
-
-    if "date" not in df.columns:
-        raise ValueError(f"Cannot find datetime column. Found: {list(df.columns)}")
-
-    try:
-        df["date"] = pd.to_datetime(df["date"], format=date_format)
-    except ValueError:
-        df["date"] = pd.to_datetime(df["date"])
-
-    required = {"open", "high", "low", "close"}
-    missing  = required - set(df.columns)
-    if missing:
-        raise ValueError(f"CSV missing columns: {missing}. Found: {list(df.columns)}")
-
-    if "volume" not in df.columns:
-        df["volume"] = np.nan
-
-    # Keep VWAP if present (used by some strategies e.g. FGBLMomentum)
-    keep = ["date", "open", "high", "low", "close", "volume", "vwap"]
-    df   = df[[c for c in keep if c in df.columns]]
-    df.sort_values("date", inplace=True)
-    df.set_index("date", inplace=True)
-    return df
+    return load_raw(path, date_format)
 
 
 # ---------------------------------------------------------------------------
@@ -101,16 +69,64 @@ def run_backtest(
         return {"symbol": symbol, "split": split,
                 "error": f"Missing tick specs for {symbol}"}
 
-    path = dataset.get(split)
-    if not path:
-        return {"symbol": symbol, "split": split,
-                "error": f"No '{split}' file defined for {symbol}"}
-    if not Path(path).exists():
-        return {"symbol": symbol, "split": split,
-                "error": f"File not found: {path}"}
+    date_format = dataset["date_format"]
+    period      = dataset.get("period")       # (from_date, to_date) or None
 
-    # Always load 1m data
-    df_1m = load_data(path, dataset["date_format"])
+    # --- Determine data source ---
+    # Prefer full-history cache; fall back to split-specific CSVs
+    full_path = dataset.get("full")
+    raw_path  = dataset.get(split) or full_path
+
+    if not raw_path:
+        return {"symbol": symbol, "split": split,
+                "error": f"No data file defined for {symbol}"}
+    if not Path(raw_path).exists():
+        return {"symbol": symbol, "split": split,
+                "error": f"File not found: {raw_path}"}
+
+    # --- Load 1m data ---
+    # If full CSV exists: use cache (auto-build on first run, fast thereafter).
+    # build_cache writes split_date synchronously, so filter is always correct.
+    # If no full CSV: fall back to split-specific CSV (original behaviour).
+    if full_path and Path(full_path).exists():
+        df_1m = load_cached(
+            symbol=symbol,
+            timeframe=1,
+            raw_path=full_path,
+            date_format=date_format,
+            auto_build=True,
+            verbose=False,
+        )
+        # Apply filter — split_date guaranteed in index after load_cached returns
+        if period is not None:
+            from_date, to_date = period
+            if from_date:
+                df_1m = df_1m[df_1m.index >= pd.Timestamp(from_date)]
+            if to_date:
+                df_1m = df_1m[df_1m.index <= pd.Timestamp(to_date)]
+        elif split in ("train", "test"):
+            split_date = dataset.get("split_date") or get_split_date(symbol)
+            if split_date:
+                if split == "train":
+                    df_1m = df_1m[df_1m.index < pd.Timestamp(split_date)]
+                else:
+                    df_1m = df_1m[df_1m.index >= pd.Timestamp(split_date)]
+    else:
+        # No full CSV — load split-specific CSV directly (original behaviour)
+        if period is not None:
+            load_path = raw_path
+            df_1m = load_raw(load_path, date_format)
+            from_date, to_date = period
+            if from_date:
+                df_1m = df_1m[df_1m.index >= pd.Timestamp(from_date)]
+            if to_date:
+                df_1m = df_1m[df_1m.index <= pd.Timestamp(to_date)]
+        else:
+            df_1m = load_raw(raw_path, date_format)
+
+    if len(df_1m) == 0:
+        return {"symbol": symbol, "split": split,
+                "error": "No data in selected period"}
 
     # Inject tick_size into strategy params so it can use it
     # for breakout/entry/stop calculations

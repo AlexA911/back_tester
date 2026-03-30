@@ -55,6 +55,7 @@ def save_best_params(
     params: dict[str, Any],
     metrics: dict[str, Any],
     timestamp: str,
+    influence: dict[str, Any] | None = None,
 ) -> None:
     BEST_PARAMS_DIR.mkdir(parents=True, exist_ok=True)
     path = _filepath(strategy_name, assets, split)
@@ -68,12 +69,16 @@ def save_best_params(
         if new_pf <= existing_pf:
             return  # Keep the better result
 
+    # Strip internal/runtime keys before saving (e.g. _presampled_sig)
+    clean_params = {k: v for k, v in params.items() if not k.startswith("_")}
+
     data = {
         "strategy":     strategy_name,
         "assets":       sorted(assets),
         "split":        split,
         "saved_at":     timestamp,
-        "params":       params,
+        "params":       clean_params,
+        "influence":    influence or {},
         "metrics": {
             "profit_factor": round(float(metrics.get("profit_factor", 0)), 4),
             "num_trades":    int(metrics.get("num_trades", 0)),

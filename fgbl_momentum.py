@@ -165,36 +165,41 @@ class FGBLMomentum(Strategy):
             )
 
         # ----------------------------------------------------------------
-        # 1. Build 120m signal bars — left/left with anchor offset
+        # 1. Build signal bars — use pre-resampled cache if available
         # ----------------------------------------------------------------
         sig_min    = int(p["signal_minutes"])
         offset_min = int(p["anchor_offset_minutes"])
 
-        m1_idx = df_1m.copy()
-        m1_idx.index = pd.to_datetime(m1_idx.index)
+        # Check if pre-resampled data was injected via params (from grid_search cache)
+        _presampled = p.get("_presampled_sig")
+        if _presampled is not None:
+            sig = _presampled.copy()
+        else:
+            m1_idx = df_1m.copy()
+            m1_idx.index = pd.to_datetime(m1_idx.index)
 
-        sig = m1_idx.resample(
-            f"{sig_min}min",
-            label="left",
-            closed="left",
-            origin="start_day",
-            offset=f"{offset_min}min",
-        ).agg({
-            "open":   "first",
-            "high":   "max",
-            "low":    "min",
-            "close":  "last",
-            "volume": "sum",
-        }).dropna(subset=["open", "close"])
+            sig = m1_idx.resample(
+                f"{sig_min}min",
+                label="left",
+                closed="left",
+                origin="start_day",
+                offset=f"{offset_min}min",
+            ).agg({
+                "open":   "first",
+                "high":   "max",
+                "low":    "min",
+                "close":  "last",
+                "volume": "sum",
+            }).dropna(subset=["open", "close"])
 
-        # VWAP: last value in each signal bar (session VWAP)
-        sig["vwap"] = m1_idx["vwap"].resample(
-            f"{sig_min}min",
-            label="left",
-            closed="left",
-            origin="start_day",
-            offset=f"{offset_min}min",
-        ).last()
+            # VWAP: last value in each signal bar (session VWAP)
+            sig["vwap"] = m1_idx["vwap"].resample(
+                f"{sig_min}min",
+                label="left",
+                closed="left",
+                origin="start_day",
+                offset=f"{offset_min}min",
+            ).last()
 
         # ----------------------------------------------------------------
         # 2. Indicators on signal bars

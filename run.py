@@ -121,17 +121,95 @@ def select_assets() -> list[str]:
 # 2. Split selection
 # ---------------------------------------------------------------------------
 
-def select_split() -> str:
-    _section("DATA SPLIT")
-    options = ["train", "test", "both"]
-    print("  1   train")
-    print("  2   test")
-    print("  3   both  (grid on train → top 3 validated on test)")
+def _load_named_periods() -> list:
+    """Load named market periods from JSON file."""
+    import json
+    p = Path(__file__).parent / "named_periods.json"
+    if not p.exists():
+        return []
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def select_split() -> tuple[str, dict]:
+    """
+    Select data period for the backtest.
+
+    Returns:
+        (split_label, period_spec) where period_spec is a dict containing:
+            split_date  — for train/test modes
+            period      — (from_date, to_date) for custom/named modes
+            label       — human-readable description
+    """
+    _section("DATA PERIOD")
+    print("  1   Train         (first half of available data)")
+    print("  2   Test          (second half of available data)")
+    print("  3   Both          (grid on train → top 3 validated on test)")
+    print("  4   Custom        (specify start and end date)")
+    print("  5   Named period  (select a market event)")
     print()
-    choice = input("  Select split [1]: ").strip() or "1"
-    split  = options[int(choice) - 1] if choice in ("1", "2", "3") else "train"
-    print(f"\n  → Split: {split}")
-    return split
+    choice = input("  Select [1]: ").strip() or "1"
+
+    if choice == "1":
+        print("\n  → Split: train")
+        return "train", {"split_date": None, "period": None, "label": "train"}
+
+    elif choice == "2":
+        print("\n  → Split: test")
+        return "test", {"split_date": None, "period": None, "label": "test"}
+
+    elif choice == "3":
+        # Both — optionally allow custom split date
+        raw_sd = input("  Split date [YYYY-MM-DD] (Enter = use dataset default): ").strip()
+        split_date = raw_sd if raw_sd else None
+        label = f"both (split: {split_date})" if split_date else "both"
+        print(f"\n  → Split: both" + (f"  (boundary: {split_date})" if split_date else ""))
+        return "both", {"split_date": split_date, "period": None, "label": label}
+
+    elif choice == "4":
+        print()
+        from_raw = input("  Start date [YYYY-MM-DD] (Enter = beginning of data): ").strip()
+        to_raw   = input("  End date   [YYYY-MM-DD] (Enter = end of data): ").strip()
+        from_date = from_raw if from_raw else None
+        to_date   = to_raw   if to_raw   else None
+        parts = []
+        if from_date: parts.append(f"from {from_date}")
+        if to_date:   parts.append(f"to {to_date}")
+        label = "Custom: " + (", ".join(parts) if parts else "full history")
+        print(f"\n  → {label}")
+        return "custom", {"split_date": None, "period": (from_date, to_date), "label": label}
+
+    elif choice == "5":
+        periods = _load_named_periods()
+        if not periods:
+            print("  No named periods found. Edit named_periods.json to add some.")
+            print("  Defaulting to train split.")
+            return "train", {"split_date": None, "period": None, "label": "train"}
+
+        print()
+        print(f"  {'#':<4} {'Label':<30} {'From':<12} {'To':<12}  Notes")
+        print(f"  {'-'*4} {'-'*30} {'-'*12} {'-'*12}  {'-'*30}")
+        for i, p in enumerate(periods, 1):
+            print(f"  {i:<4} {p['label']:<30} {p['from']:<12} {p['to']:<12}  {p.get('notes','')}")
+        print()
+        raw_p = input(f"  Select period [1]: ").strip() or "1"
+        try:
+            chosen = periods[int(raw_p) - 1]
+        except (ValueError, IndexError):
+            chosen = periods[0]
+
+        from_date = chosen["from"]
+        to_date   = chosen["to"]
+        label     = chosen["label"]
+        print(f"\n  → Named period: {label}  ({from_date} → {to_date})")
+        return "named", {"split_date": None, "period": (from_date, to_date), "label": label}
+
+    else:
+        print("\n  → Split: train (default)")
+        return "train", {"split_date": None, "period": None, "label": "train"}
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +755,15 @@ def select_param_grid(timeframe: str, assets: list[str] | None = None) -> dict[s
             param_grid[param] = [default]
             continue
 
-        print(f"  — {param} (default: {default})")
+        # Check if this param was non-influential in the last run
+        _prior_influence = (prior or {}).get("influence", {})
+        _inf_data = _prior_influence.get(param, {})
+        if _inf_data and not _inf_data.get("influential", True):
+            _vals_tested = ", ".join(_inf_data.get("values_tested", []))
+            print(f"  — {param} (default: {default})"
+                  f"  ⚠  no influence in last run (tested: {_vals_tested})")
+        else:
+            print(f"  — {param} (default: {default})")
 
         if isinstance(default, bool):
             raw    = input(f"      options [y/n] (default: {'y' if default else 'n'}): ").strip().lower()
@@ -847,6 +933,69 @@ def print_run_header(assets, split, timeframe, mode, params_or_grid) -> None:
 # Single run results
 # ---------------------------------------------------------------------------
 
+def print_lot_breakdown(trades_df: pd.DataFrame, n_lots: int = 3) -> None:
+    """Print per-lot contribution table from a trades DataFrame."""
+    if trades_df is None or trades_df.empty:
+        return
+
+    # Check which lots exist
+    lots = [k for k in range(1, n_lots + 1)
+            if f"lot{k}_raw_pnl" in trades_df.columns]
+    if not lots:
+        return
+
+    total_trades = len(trades_df)
+    comm_per_lot = 4.0  # $2/side round trip per lot
+
+    print()
+    print(f"  {'─'*72}")
+    print(f"  Per-Lot Breakdown  ({total_trades} trades)")
+    print(f"  {'─'*72}")
+    print(f"  {'Lot':<8} {'Net PnL':>12}  {'Avg/Trade':>10}  {'Winners':>8}  "
+          f"{'WR':>6}  {'Avg Win':>10}  {'Avg Loss':>10}  {'PF':>6}")
+    print(f"  {'─'*72}")
+
+    for k in lots:
+        col    = f"lot{k}_raw_pnl"
+        pnl    = trades_df[col]
+        comm   = comm_per_lot * total_trades
+        net    = pnl.sum() - comm
+        wins   = pnl[pnl > comm_per_lot]   # net positive after commission
+        losses = pnl[pnl <= comm_per_lot]
+        wr     = len(wins) / total_trades if total_trades else 0
+        avg_w  = wins.mean() if len(wins) else 0
+        avg_l  = losses.mean() if len(losses) else 0
+        gross_w = pnl[pnl > 0].sum()
+        gross_l = pnl[pnl <= 0].sum()
+        pf     = (gross_w / abs(gross_l)) if gross_l != 0 else float("inf")
+
+        # Exit reason summary for this lot
+        reason_col = f"lot{k}_exit_reason"
+        if reason_col in trades_df.columns:
+            top_reason = trades_df[reason_col].value_counts().index[0]
+            reason_str = f"  ← {top_reason}"
+        else:
+            reason_str = ""
+
+        label = f"Lot {k}"
+        print(f"  {label:<8} ${net:>11,.0f}  ${net/total_trades:>9,.0f}  "
+              f"{len(wins):>8,}  {wr:>5.1%}  ${avg_w:>9,.0f}  "
+              f"${avg_l:>9,.0f}  {pf:>6.2f}{reason_str}")
+
+    # Combined row
+    all_raw = sum(trades_df[f"lot{k}_raw_pnl"] for k in lots)
+    total_comm = comm_per_lot * len(lots) * total_trades
+    net_total  = all_raw.sum() - total_comm
+    wins_all   = all_raw[all_raw > 0].sum()
+    loss_all   = all_raw[all_raw <= 0].sum()
+    pf_all     = (wins_all / abs(loss_all)) if loss_all != 0 else float("inf")
+    print(f"  {'─'*72}")
+    print(f"  {'COMBINED':<8} ${net_total:>11,.0f}  ${net_total/total_trades:>9,.0f}  "
+          f"{'':>8}  {'':>6}  {'':>10}  {'':>10}  {pf_all:>6.2f}")
+    print(f"  {'─'*72}")
+    print()
+
+
 def print_single_results(results: dict, assets: list[str]) -> None:
     print(f"  {'Asset':<14} {'Bars':>7}  {'1m Bars':>8}  {'Trades':>6}  {'Net PnL':>12}  "
           f"{'WR':>6}  {'PF':>6}  {'Sharpe':>7}  {'MaxDD':>12}")
@@ -903,6 +1052,15 @@ def print_single_results(results: dict, assets: list[str]) -> None:
     print()
     print(f"  Errors           : {[k for k, v in results.items() if 'error' in v] or 'none'}")
     print(f"  Total commission : ${total_comm:,.0f}")
+
+    # --- Per-lot breakdown ---
+    all_trades = pd.concat([v["trades"] for v in valid.values()
+                            if v.get("trades") is not None and not v["trades"].empty],
+                           ignore_index=True)
+    if not all_trades.empty:
+        n_lots = max((int(c[3]) for c in all_trades.columns
+                      if c.startswith("lot") and c[3].isdigit()), default=0)
+        print_lot_breakdown(all_trades, n_lots=n_lots)
 
     # --- Exit reason breakdown ---
     all_reasons = {}
@@ -1082,7 +1240,7 @@ def print_grid_results(results: dict, assets: list[str], param_grid: dict) -> No
 # ---------------------------------------------------------------------------
 
 
-def _offer_cross_split_run(current_split, assets, timeframe, params, base_config, timestamp):
+def _offer_cross_split_run(current_split, assets, timeframe, params, base_config, timestamp, period_spec=None):
     """After a train run, offer to immediately run the same params on test (and vice versa)."""
     other_split = "test" if current_split == "train" else "train"
     print()
@@ -1105,8 +1263,18 @@ def _offer_cross_split_run(current_split, assets, timeframe, params, base_config
             print(f"  WARNING: Could not load {key} {other_split}: {e}")
             continue
 
+        def _make_dataset(k):
+            from datasets import DATASETS
+            ds = dict(DATASETS[k])
+            if period_spec:
+                if period_spec.get("split_date"):
+                    ds["split_date"] = period_spec["split_date"]
+                if period_spec.get("period"):
+                    ds["period"] = period_spec["period"]
+            return ds
+
         result = run_backtest(
-            dataset=dataset,
+            dataset=_make_dataset(key),
             strategy=STRATEGY_CLASS(params=params),
             split=other_split,
             trade_size=sum(int(params.get(f"lot{k}_size", 0)) for k in range(1, 4)
@@ -1156,7 +1324,7 @@ def main():
         print("No assets selected — exiting.")
         return {}
 
-    split     = select_split()
+    split, period_spec = select_split()
     # Strategies that handle their own resampling always execute on 1m
     if getattr(STRATEGY_CLASS, "manages_own_lots", False):
         timeframe = "1m"
@@ -1164,6 +1332,19 @@ def main():
     else:
         timeframe = select_timeframe()
     mode      = select_mode()
+
+    # Determine effective split for train/test logic
+    # custom/named modes behave like "train" for single-period runs
+    _base_split = split if split in ("train", "test", "both") else "train"
+
+    def _make_dataset(key: str) -> dict:
+        """Inject period_spec into dataset dict for this run."""
+        ds = dict(DATASETS[key])
+        if period_spec.get("split_date"):
+            ds["split_date"] = period_spec["split_date"]
+        if period_spec.get("period"):
+            ds["period"] = period_spec["period"]
+        return ds
 
     # Shared config dict — passed to exporter for run_config.txt
     base_config = {
@@ -1245,14 +1426,14 @@ def main():
         defaults = STRATEGY_CLASS().params
         params = {**defaults, **SINGLE_PARAMS, **ml_params, "timeframe": timeframe}
         effective_trade_size = ml_trade_size if ml_params.get("multi_lot") else TRADE_SIZE
-        print_run_header(assets, split, timeframe, mode, params)
+        print_run_header(assets, period_spec.get("label", split), timeframe, mode, params)
 
         results = {}
         for key in assets:
             results[key] = run_backtest(
-                dataset=DATASETS[key],
+                dataset=_make_dataset(key),
                 strategy=STRATEGY_CLASS(params=params),
-                split=split,
+                split=_base_split,
                 trade_size=effective_trade_size,
                 commission_per_side=COMMISSION,
             )
@@ -1274,7 +1455,7 @@ def main():
         # Offer to run the opposite split with same params
         if split in ("train", "test"):
             _offer_cross_split_run(split, assets, timeframe, params,
-                                   base_config, timestamp)
+                                   base_config, timestamp, period_spec=period_spec)
 
         return results
 
@@ -1294,7 +1475,8 @@ def main():
 
         # For "both": always run grid on train, then validate top 3 on test
         train_split = "train" if split == "both" else split
-        print_run_header(assets, train_split, timeframe, mode, param_grid)
+        _ds_override = {k: _make_dataset(k) for k in assets}
+        print_run_header(assets, period_spec.get("label", train_split), timeframe, mode, param_grid)
 
         results = run_grid_search(
             param_grid=param_grid,
@@ -1305,9 +1487,22 @@ def main():
             commission=COMMISSION,
             rank_by=RANK_BY,
             min_trades=MIN_TRADES,
+            datasets_override=_ds_override,
         )
 
         print_grid_results(results, assets, param_grid)
+
+        # Report parameter influence
+        _influence = results.get("influence", {})
+        if _influence:
+            _no_effect = [p for p, d in _influence.items() if not d.get("influential")]
+            _has_effect = [p for p, d in _influence.items() if d.get("influential")]
+            if _no_effect:
+                print(f"  ⚠  No influence on PF: {', '.join(_no_effect)}")
+                print(f"     (consider removing from grid or setting to single value)")
+            if _has_effect:
+                print(f"  ✓  Influential params: {', '.join(_has_effect)}")
+            print()
 
         shared   = results["shared_ranking"]
         all_runs = results["all_results"]
@@ -1334,6 +1529,7 @@ def main():
                     "max_drawdown":  shared.iloc[0].get("max_drawdown", 0),
                 },
                 timestamp=timestamp,
+                influence=results.get("influence", {}),
             )
             # Find matching result set for best combo (for export/validation)
             best_results = {}
@@ -1343,6 +1539,40 @@ def main():
                     for sym, res in r["per_asset"].items():
                         best_results[sym] = res
                     break
+
+            # --- Per-lot breakdown for best combo (per asset) ---
+            _best_per_asset = {}
+            for _r in all_runs:
+                if all(str(_r["params"].get(k)) == str(v)
+                       for k, v in best_params.items()
+                       if not k.startswith("_")):
+                    _best_per_asset = _r.get("per_asset", {})
+                    break
+
+            if _best_per_asset:
+                # Check if multi-lot
+                _sample_t = next((v.get("trades") for v in _best_per_asset.values()
+                                  if v.get("trades") is not None and
+                                  not v["trades"].empty), None)
+                if _sample_t is not None:
+                    _nlots = max((int(c[3]) for c in _sample_t.columns
+                                  if c.startswith("lot") and c[3].isdigit()), default=0)
+                    if _nlots > 1:
+                        print(f"  Per-lot breakdown (best combo):")
+                        # Per asset
+                        _all_lot_dfs = []
+                        for _akey in assets:
+                            _ar = _best_per_asset.get(_akey, {})
+                            _t  = _ar.get("trades")
+                            if _t is not None and not _t.empty:
+                                print(f"    {_akey}  ({len(_t)} trades):")
+                                print_lot_breakdown(_t, n_lots=_nlots)
+                                _all_lot_dfs.append(_t)
+                        # Aggregate across all assets
+                        if len(_all_lot_dfs) > 1:
+                            _agg_df = pd.concat(_all_lot_dfs, ignore_index=True)
+                            print(f"    AGGREGATE  ({len(_agg_df)} trades):")
+                            print_lot_breakdown(_agg_df, n_lots=_nlots)
 
             export_results(
                 results=best_results,
@@ -1380,8 +1610,12 @@ def main():
                     for r in top_runs:
                         test_per_asset = {}
                         for key in assets:
+                            # For "both" mode: test period = everything after split_date
+                            _test_ds = dict(DATASETS[key])
+                            if period_spec.get("split_date"):
+                                _test_ds["split_date"] = period_spec["split_date"]
                             test_res = run_backtest(
-                                dataset=DATASETS[key],
+                                dataset=_test_ds,
                                 strategy=STRATEGY_CLASS(params=r["params"]),
                                 split="test",
                                 trade_size=TRADE_SIZE,
@@ -1404,7 +1638,7 @@ def main():
                 # Offer to run the opposite split with same params
                 if split in ("train", "test"):
                     _offer_cross_split_run(split, assets, timeframe, best_params,
-                                           base_config, timestamp)
+                                           base_config, timestamp, period_spec=period_spec)
 
         return results
 

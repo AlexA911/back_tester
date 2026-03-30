@@ -189,7 +189,7 @@ DATASETS: Dict[str, Dict[str, Any]] = {
         "full": p('ZN.csv'),
         "symbol": 'ZN',
         "tick_size": 0.015625,
-        "tick_value": 7.8125,  # ← fix: 1/64 × $1000 = $7.8125
+        "tick_value": 15.625,  # 1/64 × $1,000
         "point_value": 1000.0,
         "currency": 'USD',
         "timeframe": 1,
