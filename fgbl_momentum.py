@@ -80,6 +80,12 @@ class FGBLMomentum(Strategy):
         r2_timeout_bars      (int):   1m bars before runner2 times out. Default 2400.
         hook_atr_mult        (float): Runner2 hook = entry ± hook_atr_mult × ATR. Default 0.4.
         chandelier_atr_mult  (float): Chandelier trail = best ∓ chandelier_atr_mult × ATR. Default 0.25.
+        atr_regime_filter    (float): Skip signals where ATR > this value. 0.0 = off. Default 0.0.
+        cot_regime_filter    (str):   Use ZN slope signal as regime filter.
+                                      'off'       = disabled (default)
+                                      'gate'      = skip signals when ZN signal == 0 (flat zone)
+                                      'direction' = only take longs when ZN==+1, shorts when ZN==-1
+                                      'both'      = gate + direction combined
         direction            (str):   'both'/'long_only'/'short_only'. Default 'both'.
         timeframe            (str):   Must be '1m'. Default '1m'.
     """
@@ -120,6 +126,8 @@ class FGBLMomentum(Strategy):
             "r2_timeout_bars":       2400,
             "hook_atr_mult":         0.4,
             "chandelier_atr_mult":   0.25,
+            "atr_regime_filter":     0.0,
+            "cot_regime_filter":     "off",
             "direction":             "both",
             "timeframe":             "1m",
         }
@@ -127,6 +135,28 @@ class FGBLMomentum(Strategy):
     def generate_signals(self, df_1m: pd.DataFrame) -> dict:
         p  = self.params
         ts = p.get("tick_size", 0.01)
+
+        # Load COT regime signal if filter is active
+        _cot_filter = str(p.get("cot_regime_filter", "off")).lower()
+        _cot_signal = None
+        if _cot_filter != "off":
+            import os
+            _sig_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "data", "ZN_refined_signal.csv"
+            )
+            try:
+                _cot_df = pd.read_csv(_sig_path, parse_dates=["Timestamp"])
+                _cot_df = _cot_df.set_index("Timestamp")["signal"]
+                _cot_signal = _cot_df
+            except FileNotFoundError:
+                import warnings
+                warnings.warn(
+                    f"cot_regime_filter is '{_cot_filter}' but signal file not found: "
+                    f"{_sig_path}. Run update_signal.py first. Filter disabled.",
+                    UserWarning
+                )
+                _cot_filter = "off"
 
         if "vwap" not in df_1m.columns:
             raise ValueError(
@@ -214,6 +244,36 @@ class FGBLMomentum(Strategy):
             (rsi < rsi_short)
         )
 
+        # ATR regime filter — skip signals in high-volatility bars
+        atr_regime = float(p.get("atr_regime_filter", 0.0))
+        if atr_regime > 0:
+            regime_ok_atr = atr <= atr_regime
+            long_sig  = long_sig  & regime_ok_atr
+            short_sig = short_sig & regime_ok_atr
+
+        # COT regime filter — align signal bars with ZN weekly signal
+        if _cot_filter != "off" and _cot_signal is not None:
+            # Forward-fill ZN signal to 120m signal bar timestamps
+            # Each signal bar's date is used to look up the ZN signal
+            sig_dates  = sig.index.normalize()
+            zn_aligned = pd.Series(index=sig.index, dtype=float)
+            for dt in sig_dates.unique():
+                # Find most recent ZN signal on or before this date
+                past = _cot_signal[_cot_signal.index.normalize() <= dt]
+                zn_val = past.iloc[-1] if len(past) > 0 else 0.0
+                zn_aligned[sig_dates == dt] = zn_val
+
+            if _cot_filter in ("gate", "both"):
+                # Block all signals when ZN is in flat zone (signal == 0)
+                zn_active = zn_aligned != 0
+                long_sig  = long_sig  & zn_active
+                short_sig = short_sig & zn_active
+
+            if _cot_filter in ("direction", "both"):
+                # Only take longs when ZN bullish (+1), shorts when ZN bearish (-1)
+                long_sig  = long_sig  & (zn_aligned == 1)
+                short_sig = short_sig & (zn_aligned == -1)
+
         direction = p["direction"]
         if direction == "long_only":
             short_sig = pd.Series(False, index=sig.index)
@@ -277,10 +337,10 @@ class FGBLMomentum(Strategy):
             is_long   = bool(row["long_sig"])
             sig_atr   = float(row["atr"])
             sig_ema   = float(row["ema_mid"])
-            sig_close = float(row["close"])
+            signal_bar_close = float(row["close"])  # close of completed signal bar (bar before entry)
 
             # Entry price = signal bar close ± 1 tick
-            ep = _ceil_tick(sig_close + ts, ts) if is_long else _floor_tick(sig_close - ts, ts)
+            ep = _ceil_tick(signal_bar_close + ts, ts) if is_long else _floor_tick(signal_bar_close - ts, ts)
 
             # Base target = entry ± base_tp_atr × ATR
             bt = _ceil_tick(ep + float(p["base_tp_atr"]) * sig_atr, ts) if is_long \

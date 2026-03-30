@@ -5,7 +5,7 @@ SECTORS: dict[str, list[str]] = {
     "US Equities":       ["ES", "NQ", "YM", "RTY"],
     "European Equities": ["FDAX", "FESX"],
     "US Bonds":          ["ZN"],
-    "European Bonds":    ["FGBL", "FGBM", "FGBS", "FBTP"],
+    "European Bonds":    ["FGBL", "FGBM", "FGBS", "FBTP", "R"],
     "FX":                ["6A", "6B", "6E", "6J"],
     "Energy":            ["CL", "BRN", "NG", "HO"],
     "Metals":            ["GC", "SI", "HG", "G"],

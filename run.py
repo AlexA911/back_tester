@@ -29,7 +29,7 @@ from fgbl_momentum import FGBLMomentum
 from resampler import TIMEFRAME_MAP
 from exporter import export_results
 from validator import run_validation
-from best_params import save_best_params, load_best_params
+from best_params import save_best_params, load_best_params, list_best_params
 
 
 # ============================================================================
@@ -243,33 +243,29 @@ def _safe_int_range(p_min, p_max, p_step):
     return list(range(p_min, p_max + 1, p_step))
 
 
-def _ml_defaults_for_n(n_lots: int) -> dict:
+def _ml_defaults_for_n(n_lots: int, prior_params: dict | None = None) -> dict:
     """Build default multi-lot param dict for n lots (all size=1).
-    Uses strategy's default_lot_config if present (e.g. FGBLMomentum).
+    Uses prior_params (best saved) first, then default_lot_config, then strategy defaults.
     """
     d   = STRATEGY_CLASS().params
     dlc = getattr(STRATEGY_CLASS, "default_lot_config", None)
+    p   = prior_params or {}
     out = {"multi_lot": True}
     for k in range(1, n_lots + 1):
         idx = k - 1
-        if dlc and idx < len(dlc):
-            cfg = dlc[idx]
-            out[f"lot{k}_size"]       = 1
-            out[f"lot{k}_tp_points"]  = cfg.get("tp_points", 0.0)
-            out[f"lot{k}_stop_mode"]  = cfg.get("stop_mode", "breakeven")
-            out[f"lot{k}_exit_modes"] = cfg.get("exit_modes", "ema_flip,time_exit")
-        else:
-            out[f"lot{k}_size"]       = 1
-            out[f"lot{k}_tp_points"]  = d.get(f"lot{k}_tp_points", 0.0)
-            out[f"lot{k}_stop_mode"]  = d.get(f"lot{k}_stop_mode", "breakeven")
-            out[f"lot{k}_exit_modes"] = d.get(f"lot{k}_exit_modes", "ema_flip,time_exit")
+        cfg = dlc[idx] if (dlc and idx < len(dlc)) else {}
+        out[f"lot{k}_size"]          = 1
+        out[f"lot{k}_tp_points"]     = p.get(f"lot{k}_tp_points",     cfg.get("tp_points",  d.get(f"lot{k}_tp_points",  0.0)))
+        out[f"lot{k}_stop_mode"]     = p.get(f"lot{k}_stop_mode",     cfg.get("stop_mode",  d.get(f"lot{k}_stop_mode",  "breakeven")))
+        out[f"lot{k}_exit_modes"]    = p.get(f"lot{k}_exit_modes",    cfg.get("exit_modes", d.get(f"lot{k}_exit_modes",  "ema_flip,time_exit")))
+        out[f"lot{k}_atr_stop_mult"] = p.get(f"lot{k}_atr_stop_mult", cfg.get("atr_stop_mult", 0.0))
     # disable unused lots
     for k in range(n_lots + 1, 4):
         out[f"lot{k}_size"] = 0
-    out["runner_ema_fast"]        = d.get("runner_ema_fast", 9)
-    out["runner_ema_slow"]        = d.get("runner_ema_slow", 21)
-    out["runner_time_bars"]       = d.get("runner_time_bars", 120)
-    out["runner_activation_atr"]  = d.get("runner_activation_atr", 0.0)
+    out["runner_ema_fast"]        = p.get("runner_ema_fast",       d.get("runner_ema_fast", 9))
+    out["runner_ema_slow"]        = p.get("runner_ema_slow",       d.get("runner_ema_slow", 21))
+    out["runner_time_bars"]       = p.get("runner_time_bars",      d.get("runner_time_bars", 120))
+    out["runner_activation_atr"]  = p.get("runner_activation_atr", d.get("runner_activation_atr", 0.0))
     return out
 
 def _select_multi_lot_single(prior_params: dict | None = None) -> tuple[dict, int]:
@@ -279,14 +275,19 @@ def _select_multi_lot_single(prior_params: dict | None = None) -> tuple[dict, in
     _dlc = getattr(STRATEGY_CLASS, "default_lot_config", None)
     _dn  = getattr(STRATEGY_CLASS, "default_n_lots", None)
     if _dlc and _dn:
-        _lot_sum = ", ".join(
-            f"Lot{i+1}={'runner:'+lc['exit_modes'] if lc['is_runner'] else 'fixed:'+str(lc['tp_points'])+'xATR'}"
-            for i, lc in enumerate(_dlc[:_dn])
-        )
+        # Build summary from effective params (prior best if available, else class defaults)
+        _p = prior_params or {}
+        def _lot_label(i, lc):
+            k = i + 1
+            em = _p.get(f"lot{k}_exit_modes", lc.get("exit_modes", "fixed"))
+            tp = _p.get(f"lot{k}_tp_points",  lc.get("tp_points",  0.0))
+            is_runner = float(tp) <= 0
+            return f"Lot{k}={'runner:'+str(em) if is_runner else 'fixed:'+str(tp)+'xATR'}"
+        _lot_sum = ", ".join(_lot_label(i, _dlc[i]) for i in range(_dn))
         print(f"  Default: {_dn} lots  ({_lot_sum})")
         if input("  Change multi-lot config? [y/N]: ").strip().lower() not in ("y", "yes"):
             print()
-            return _ml_defaults_for_n(_dn), _dn
+            return _ml_defaults_for_n(_dn, prior_params=prior_params), _dn
         print()
     use_ml = input("  Enable multi-lot? [y/N]: ").strip().lower() in ("y", "yes")
     if not use_ml:
@@ -299,12 +300,7 @@ def _select_multi_lot_single(prior_params: dict | None = None) -> tuple[dict, in
     print()
 
     defs = STRATEGY_CLASS().params
-    d    = _ml_defaults_for_n(n_lots)
-    # Override with prior best params if available
-    if prior_params:
-        for _k, _v in prior_params.items():
-            if _k in d:
-                d[_k] = _v
+    d    = _ml_defaults_for_n(n_lots, prior_params=prior_params)
     has_runner = False
 
     for k in range(1, n_lots + 1):
@@ -368,21 +364,25 @@ def _select_multi_lot_grid(tick_size: float, price_params: set, prior_params: di
     _dn  = getattr(STRATEGY_CLASS, "default_n_lots", None)
     defs = {**STRATEGY_CLASS().params, **(prior_params or {})}
     if _dlc and _dn:
-        _lot_sum = ", ".join(
-            f"Lot{i+1}={'runner:'+lc['exit_modes'] if lc['is_runner'] else 'fixed:'+str(lc['tp_points'])+'xATR'}"
-            for i, lc in enumerate(_dlc[:_dn])
-        )
+        # Build summary from effective params (prior best if available, else class defaults)
+        def _lot_label(i, lc):
+            k = i + 1
+            em = defs.get(f"lot{k}_exit_modes", lc.get("exit_modes", "fixed"))
+            tp = defs.get(f"lot{k}_tp_points",  lc.get("tp_points",  0.0))
+            is_runner = float(tp) <= 0
+            return f"Lot{k}={'runner:'+str(em) if is_runner else 'fixed:'+str(tp)+'xATR'}"
+        _lot_sum = ", ".join(_lot_label(i, _dlc[i]) for i in range(_dn))
         print(f"  Default: {_dn} lots  ({_lot_sum})")
         if input("  Change multi-lot config? [y/N]: ").strip().lower() not in ("y", "yes"):
             print()
             out = {"multi_lot": [True]}
             for k in range(1, _dn + 1):
-                cfg = _dlc[k - 1]
+                cfg = _dlc[k - 1]  # class defaults as fallback
                 out[f"lot{k}_size"]          = [1]
-                out[f"lot{k}_tp_points"]     = [cfg.get("tp_points", 0.0)]
-                out[f"lot{k}_stop_mode"]     = [cfg.get("stop_mode", "breakeven")]
-                out[f"lot{k}_exit_modes"]    = [cfg.get("exit_modes", "fixed")]
-                out[f"lot{k}_atr_stop_mult"] = [cfg.get("atr_stop_mult", 0.0)]
+                out[f"lot{k}_tp_points"]     = [defs.get(f"lot{k}_tp_points",   cfg.get("tp_points", 0.0))]
+                out[f"lot{k}_stop_mode"]     = [defs.get(f"lot{k}_stop_mode",   cfg.get("stop_mode", "breakeven"))]
+                out[f"lot{k}_exit_modes"]    = [defs.get(f"lot{k}_exit_modes",  cfg.get("exit_modes", "fixed"))]
+                out[f"lot{k}_atr_stop_mult"] = [defs.get(f"lot{k}_atr_stop_mult", cfg.get("atr_stop_mult", 0.0))]
             for k in range(_dn + 1, 4):
                 out[f"lot{k}_size"]       = [0]
                 out[f"lot{k}_tp_points"]  = [0.0]
@@ -541,6 +541,40 @@ def select_param_grid(timeframe: str, assets: list[str] | None = None) -> dict[s
     # Warm-start: offer to load previous best params as defaults
     if assets:
         prior = load_best_params(STRATEGY_CLASS.__name__, assets, "train")
+        if not prior:
+            # No exact/fallback match — offer manual choose if any saves exist
+            all_saved_check = list_best_params(STRATEGY_CLASS.__name__)
+            if all_saved_check:
+                print(f"  No previous best found for {', '.join(assets)}.")
+                use_choose = input("  Load params from another asset? [y/N]: ").strip().lower()
+                if use_choose in ("y", "yes"):
+                    print()
+                    print("  Available saved results:")
+                    print(f"  {'#':<4} {'Asset(s)':<20} {'PF':>6} {'Trades':>7} {'PnL':>12}  {'Date'}")
+                    print(f"  {'-'*4} {'-'*20} {'-'*6} {'-'*7} {'-'*12}  {'-'*16}")
+                    for _i, _s in enumerate(all_saved_check, 1):
+                        _a = ", ".join(_s.get("assets", []))
+                        _m2 = _s.get("metrics", {})
+                        try:
+                            _dt2 = datetime.strptime(
+                                _s.get("saved_at",""), "%Y%m%d_%H%M%S"
+                            ).strftime("%Y-%m-%d %H:%M")
+                        except ValueError:
+                            _dt2 = _s.get("saved_at","")
+                        print(f"  {_i:<4} {_a:<20} "
+                              f"{_m2.get('profit_factor',0):>6.2f} "
+                              f"{_m2.get('num_trades',0):>7,} "
+                              f"${_m2.get('total_pnl',0):>11,.0f}  "
+                              f"{_dt2}")
+                    print()
+                    _rc = input(f"  Select [1]: ").strip()
+                    try:
+                        _chosen = all_saved_check[int(_rc)-1 if _rc else 0]
+                        defaults = {**defaults, **_chosen["params"]}
+                        print(f"  → Using params from {', '.join(_chosen.get('assets',[]))}.")
+                    except (ValueError, IndexError):
+                        print("  Invalid — using strategy defaults.")
+                print()
         if prior:
             m = prior["metrics"]
             saved = prior["saved_at"]
@@ -558,7 +592,12 @@ def select_param_grid(timeframe: str, assets: list[str] | None = None) -> dict[s
                 if k in strategy_defaults and str(v) != str(strategy_defaults[k])
             }
 
-            print(f"  Best result on record  ({saved_fmt}):")
+            fallback_assets = prior.get("_fallback_from")
+            if fallback_assets:
+                print(f"  Best result on record  ({saved_fmt})  "
+                      f"[from {', '.join(fallback_assets)}]:")
+            else:
+                print(f"  Best result on record  ({saved_fmt}):")
             print(f"    PF={m['profit_factor']:.2f}  WR={m['win_rate']:.1%}  "
                   f"Trades={m['num_trades']:,}  PnL=${m['total_pnl']:,.0f}")
             if changed:
@@ -567,10 +606,44 @@ def select_param_grid(timeframe: str, assets: list[str] | None = None) -> dict[s
             else:
                 print(f"    No params differ from strategy defaults.")
             print()
-            use_prior = input("  Use previous best as defaults? [y/N]: ").strip().lower()
+            use_prior = input("  Use previous best as defaults? [y/N/choose]: ").strip().lower()
             if use_prior == "y":
                 defaults = {**defaults, **prior["params"]}
                 print("  → Using previous best params as defaults.")
+            elif use_prior in ("c", "choose"):
+                # Show all saved results for this strategy and let user pick
+                all_saved = list_best_params(STRATEGY_CLASS.__name__)
+                if not all_saved:
+                    print("  No saved results found.")
+                else:
+                    print()
+                    print("  Available saved results:")
+                    print(f"  {'#':<4} {'Asset(s)':<20} {'PF':>6} {'Trades':>7} {'PnL':>12}  {'Date'}")
+                    print(f"  {'-'*4} {'-'*20} {'-'*6} {'-'*7} {'-'*12}  {'-'*16}")
+                    for i, s in enumerate(all_saved, 1):
+                        a_str = ", ".join(s.get("assets", []))
+                        m2    = s.get("metrics", {})
+                        try:
+                            dt_str = datetime.strptime(
+                                s.get("saved_at",""), "%Y%m%d_%H%M%S"
+                            ).strftime("%Y-%m-%d %H:%M")
+                        except ValueError:
+                            dt_str = s.get("saved_at","")
+                        print(f"  {i:<4} {a_str:<20} "
+                              f"{m2.get('profit_factor',0):>6.2f} "
+                              f"{m2.get('num_trades',0):>7,} "
+                              f"${m2.get('total_pnl',0):>11,.0f}  "
+                              f"{dt_str}")
+                    print()
+                    raw_choice = input(f"  Select [1]: ").strip()
+                    try:
+                        idx = int(raw_choice) - 1 if raw_choice else 0
+                        chosen = all_saved[idx]
+                        defaults = {**defaults, **chosen["params"]}
+                        chosen_assets = ", ".join(chosen.get("assets", []))
+                        print(f"  → Using params from {chosen_assets}.")
+                    except (ValueError, IndexError):
+                        print("  Invalid selection — using strategy defaults.")
             print()
     param_grid = {}
 
@@ -1111,6 +1184,59 @@ def main():
         _single_prior = load_best_params(STRATEGY_CLASS.__name__, assets, "train")
         _single_defaults = {**STRATEGY_CLASS().params,
                             **(_single_prior["params"] if _single_prior else {})}
+        # Offer choose option for single mode too
+        if _single_prior:
+            _sp_m = _single_prior.get("metrics", {})
+            _sp_fa = _single_prior.get("_fallback_from")
+            try:
+                _sp_dt = datetime.strptime(_single_prior.get("saved_at",""),
+                                           "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                _sp_dt = _single_prior.get("saved_at","")
+            _sp_label = (f"[from {', '.join(_sp_fa)}]" if _sp_fa else "")
+            print(f"\n  Best result on record  ({_sp_dt}) {_sp_label}:")
+            print(f"    PF={_sp_m.get('profit_factor',0):.2f}  "
+                  f"WR={_sp_m.get('win_rate',0):.1%}  "
+                  f"Trades={_sp_m.get('num_trades',0):,}  "
+                  f"PnL=${_sp_m.get('total_pnl',0):,.0f}")
+            print()
+            _sp_choice = input("  Use previous best as defaults? [y/N/choose]: ").strip().lower()
+            if _sp_choice == "y":
+                pass  # already merged above
+            elif _sp_choice in ("c", "choose"):
+                _all_saved = list_best_params(STRATEGY_CLASS.__name__)
+                if _all_saved:
+                    print()
+                    print("  Available saved results:")
+                    print(f"  {'#':<4} {'Asset(s)':<20} {'PF':>6} {'Trades':>7} {'PnL':>12}  {'Date'}")
+                    print(f"  {'-'*4} {'-'*20} {'-'*6} {'-'*7} {'-'*12}  {'-'*16}")
+                    for _i, _s in enumerate(_all_saved, 1):
+                        _a = ", ".join(_s.get("assets", []))
+                        _m2 = _s.get("metrics", {})
+                        try:
+                            _dt2 = datetime.strptime(
+                                _s.get("saved_at",""), "%Y%m%d_%H%M%S"
+                            ).strftime("%Y-%m-%d %H:%M")
+                        except ValueError:
+                            _dt2 = _s.get("saved_at","")
+                        print(f"  {_i:<4} {_a:<20} "
+                              f"{_m2.get('profit_factor',0):>6.2f} "
+                              f"{_m2.get('num_trades',0):>7,} "
+                              f"${_m2.get('total_pnl',0):>11,.0f}  "
+                              f"{_dt2}")
+                    print()
+                    _rc = input(f"  Select [1]: ").strip()
+                    try:
+                        _chosen = _all_saved[int(_rc)-1 if _rc else 0]
+                        _single_defaults = {**STRATEGY_CLASS().params, **_chosen["params"]}
+                        print(f"  → Using params from {', '.join(_chosen.get('assets',[]))}.\n")
+                    except (ValueError, IndexError):
+                        print("  Invalid — using strategy defaults.\n")
+                else:
+                    print("  No saved results found.")
+            else:
+                _single_defaults = STRATEGY_CLASS().params  # reset to defaults
+            print()
 
         # Multi-lot selection first
         ml_params, ml_trade_size = _select_multi_lot_single(prior_params=_single_defaults)

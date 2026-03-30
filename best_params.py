@@ -96,16 +96,56 @@ def load_best_params(
     assets: list[str],
     split: str,
 ) -> dict[str, Any] | None:
+    """
+    Load best params for the given strategy/assets/split.
+    If no exact match, falls back to the best result from any single
+    asset within the current selection — useful when running a sector
+    where only individual asset results have been saved.
+    Returns (data, is_fallback) implicitly via the data dict which
+    includes an 'is_fallback' key when a fallback was used.
+    """
+    # 1. Exact match first
     path = _filepath(strategy_name, assets, split)
-    if not path.exists():
-        return None
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        # Corrupt or unreadable file — delete and start fresh
-        path.unlink(missing_ok=True)
-        return None
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            path.unlink(missing_ok=True)
+
+    # 2. Fallback: find best result from any individual asset in selection
+    if len(assets) == 1:
+        return None  # already tried exact match — no point scanning further
+
+    best = None
+    best_pf = 0.0
+    asset_set = set(assets)
+
+    BEST_PARAMS_DIR.mkdir(parents=True, exist_ok=True)
+    for path in BEST_PARAMS_DIR.glob("*.json"):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        if data.get("strategy") != strategy_name:
+            continue
+        if data.get("split") != split:
+            continue
+        # Check if saved assets are a subset of current selection
+        saved_assets = set(data.get("assets", []))
+        if not saved_assets.issubset(asset_set):
+            continue
+
+        pf = float(data.get("metrics", {}).get("profit_factor", 0))
+        if pf > best_pf:
+            best_pf = pf
+            best = data
+
+    if best is not None:
+        best["_fallback_from"] = best.get("assets", [])
+    return best
 
 
 def list_best_params(strategy_name: str | None = None) -> list[dict[str, Any]]:

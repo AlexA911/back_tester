@@ -310,8 +310,18 @@ def validate_trades(
         else:
             bar_open   = exec_df.loc[entry_time, "open"] \
                          if entry_time in exec_df.index else None
-            fill_match = abs(entry_px - bar_open) < 1e-6 if bar_open else False
-            fill_note  = f"{'✓' if fill_match else '✗'} vs bar open ({bar_open})"
+            if bar_open is not None:
+                # Limit order logic: long fills if bar opened at or below limit,
+                # short fills if bar opened at or above limit
+                is_long_trade = direction == "long"
+                if is_long_trade:
+                    fill_match = bar_open <= entry_px + 1e-6
+                else:
+                    fill_match = bar_open >= entry_px - 1e-6
+                fill_note = f"{'✓' if fill_match else '✗'} vs bar open ({bar_open})"
+            else:
+                fill_match = False
+                fill_note  = "(could not verify)"
 
         # Round prices to tick precision for display
         _dp = max(0, -int(np.floor(np.log10(tick_size)))) if tick_size < 1 else 2
