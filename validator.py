@@ -210,7 +210,13 @@ def validate_trades(
     for i, (_, trade) in enumerate(sample.iterrows(), start=1):
         entry_time  = trade["entry_time"]
         exit_time   = trade["exit_time"]
-        direction   = trade["direction"]
+        # direction column may not exist in generic engine trades (uses position column)
+        if "direction" in trade.index:
+            direction = trade["direction"]
+        elif "position" in trade.index:
+            direction = "LONG" if trade["position"] > 0 else "SHORT"
+        else:
+            direction = "LONG" if trade.get("net_pnl", 0) >= 0 else "SHORT"
         entry_px    = trade["entry_price"]
         net_pnl     = trade["net_pnl"]
         raw_pnl     = trade["raw_pnl"]

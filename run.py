@@ -26,6 +26,7 @@ from grid_search import run_grid_search
 from strategy import EMACrossover
 from momentum_ignition import MomentumIgnition
 from fgbl_momentum import FGBLMomentum
+from brent_pullback import BrentPullback
 from resampler import TIMEFRAME_MAP
 from exporter import export_results
 from validator import run_validation
@@ -217,6 +218,15 @@ def select_split() -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 def select_timeframe() -> str:
+    # Check if strategy has a fixed internal timeframe (manages own resampling)
+    _default_tf = STRATEGY_CLASS._defaults(STRATEGY_CLASS).get("timeframe", "1m")
+    _is_fixed_tf = getattr(STRATEGY_CLASS(), "uses_generic_engine", False) and _default_tf != "1m"
+
+    if _is_fixed_tf:
+        tf = _default_tf
+        print(f"\n  → Timeframe: {tf}  (fixed by strategy — internal multi-TF resampling)")
+        return tf
+
     _section("TIMEFRAME")
     timeframes = ["1m", "5m", "15m", "30m", "60m", "120m", "240m", "daily"]
     for i, tf in enumerate(timeframes, start=1):
@@ -259,6 +269,7 @@ def select_mode() -> str:
 STRATEGY_REGISTRY = {
     "1": ("MomentumIgnition", "MomentumIgnition"),
     "2": ("FGBLMomentum",     "FGBLMomentum"),
+    "3": ("BrentPullback",    "BrentPullback"),
 }
 
 def select_strategy():
@@ -266,9 +277,11 @@ def select_strategy():
     # Build registry with loaded classes so we can show descriptions
     from momentum_ignition import MomentumIgnition as _MI
     from fgbl_momentum import FGBLMomentum as _FGBL
+    from brent_pullback import BrentPullback as _BRN
     _registry = [
         ("MomentumIgnition", _MI),
         ("FGBLMomentum",     _FGBL),
+        ("BrentPullback",    _BRN),
     ]
 
     _section("STRATEGY")
@@ -435,6 +448,19 @@ def _select_multi_lot_single(prior_params: dict | None = None) -> tuple[dict, in
 
 def _select_multi_lot_grid(tick_size: float, price_params: set, prior_params: dict | None = None) -> dict:
     """Interactive multi-lot config for grid-search mode. Returns param_grid fragment."""
+
+    # Generic engine strategies manage their own lot exit logic —
+    # skip the FGBLMomentum lot config prompts and use strategy defaults
+    if getattr(STRATEGY_CLASS(), "uses_generic_engine", False):
+        n    = getattr(STRATEGY_CLASS, "n_lots", 3)
+        defs = {**STRATEGY_CLASS().params, **(prior_params or {})}
+        out  = {"multi_lot": [True]}
+        for k in range(1, n + 1):
+            out[f"lot{k}_size"] = [int(defs.get(f"lot{k}_size", 1))]
+        print(f"\n  -- Multi-lot --")
+        print(f"  {n} lots (fixed by strategy — exit logic managed internally)")
+        return out
+
     print()
     print("  -- Multi-lot --")
     # Show default lot summary for strategies with fixed lot structures

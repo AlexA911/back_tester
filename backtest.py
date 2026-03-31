@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from strategy import Strategy
-from engine import simulate_trades, simulate_trades_multilot, simulate_trades_fgbl, calculate_metrics
+from engine import simulate_trades, simulate_trades_multilot, simulate_trades_fgbl, simulate_trades_generic, calculate_metrics
 from resampler import resample_ohlcv
 from cache_manager import load_cached, load_raw, get_split_date
 
@@ -162,6 +162,43 @@ def run_backtest(
     # Determine routing — FGBLMomentum manages its own 3-lot structure
     manages_own_lots = getattr(strategy, "manages_own_lots", False)
     multi_lot = strategy.params.get("multi_lot", False)
+
+    # Route to generic engine for strategies that implement get_exit_decision()
+    if getattr(strategy, "uses_generic_engine", False):
+        if isinstance(raw, dict):
+            signals_series = raw.get("signals", pd.Series(0, index=exec_df.index))
+            # Strategy may supply its own pre-built execution df (e.g. 5m bars)
+            strat_exec_df  = raw.get("exec_df")
+            if strat_exec_df is not None:
+                exec_df = strat_exec_df
+        else:
+            signals_series = raw if raw is not None else pd.Series(0, index=exec_df.index)
+        n_lots = getattr(strategy, "n_lots", 3)
+        lot_configs = [
+            {"size": strategy.params.get(f"lot{k+1}_size", 1)}
+            for k in range(n_lots)
+        ]
+        extra_cols = raw.get("extra_cols") if isinstance(raw, dict) else None
+        trades = simulate_trades_generic(
+            df=exec_df,
+            signals=signals_series,
+            strategy=strategy,
+            tick_size=tick_size,
+            tick_value=tick_value,
+            commission_per_side=commission_per_side,
+            lot_configs=lot_configs,
+            extra_cols=extra_cols,
+        )
+        metrics = calculate_metrics(trades, exec_df)
+        metrics["trades"]           = trades
+        metrics["bars"]             = len(exec_df)
+        metrics["bars_1m"]          = len(df_1m)
+        metrics["date_range"]       = (str(exec_df.index[0]), str(exec_df.index[-1]))
+        metrics["skipped_entries"]  = 0
+        metrics["symbol"]           = symbol
+        metrics["split"]            = split
+        metrics["total_commission"] = trades["commission"].sum() if not trades.empty else 0
+        return metrics
 
     if manages_own_lots and exit_params is not None:
         from engine import simulate_trades_fgbl

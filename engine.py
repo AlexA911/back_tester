@@ -1177,6 +1177,213 @@ def simulate_trades_fgbl(
 # Performance metrics
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Generic multi-lot engine — works with any strategy implementing
+# get_exit_decision(position_state, bar_data) -> list[LotExitDecision]
+# ---------------------------------------------------------------------------
+
+def simulate_trades_generic(
+    df: pd.DataFrame,
+    signals: pd.Series,
+    strategy,
+    tick_size: float,
+    tick_value: float,
+    commission_per_side: float,
+    lot_configs: list[dict] | None = None,
+    extra_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Generic multi-lot simulation engine.
+
+    On each bar:
+      1. If flat: check for entry signal
+      2. If in position: call strategy.get_exit_decision(position_state, bar_data)
+         to get exit instructions, execute them mechanically
+
+    The strategy owns all exit logic — stop prices, target prices, trailing
+    stops, trend-flip checks, timeouts. The engine owns order execution and
+    PnL calculation only.
+
+    Args:
+        df:                   OHLCV DataFrame (execution timeframe)
+        signals:              Entry signals (+1 long, -1 short, 0 flat)
+                              aligned to df.index. entry_price pre-computed
+                              by strategy in exit_params or derived from bar open.
+        strategy:             Strategy instance with get_exit_decision() method
+        tick_size:            Minimum price increment
+        tick_value:           $ value per tick
+        commission_per_side:  Commission per lot per side in $
+        lot_configs:          List of dicts with 'size' key per lot.
+                              Default: [{"size": 1}] × n_lots from strategy.
+
+    Returns:
+        trades DataFrame with one row per closed position (combined lots),
+        matching the schema expected by calculate_metrics() and the exporter.
+    """
+    from exit_model import PositionState, BarData, LotExitDecision
+
+    point_value = tick_value / tick_size
+
+    opens  = df["open"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    closes = df["close"].values
+    times  = df.index
+    sig    = signals.reindex(df.index).fillna(0).values
+    n      = len(df)
+
+    # Determine lot structure
+    n_lots = getattr(strategy, "n_lots", 3)
+    if lot_configs is None:
+        lot_configs = [{"size": 1}] * n_lots
+
+    trades = []
+
+    # Position state
+    in_position     = False
+    position_side   = 0
+    entry_bar       = None
+    entry_time      = None
+    entry_price     = None
+    lots_open       = None
+    lot_entry_px    = None
+    high_since      = None
+    low_since       = None
+    user_state      = {}
+
+    # Per-lot exit records (filled as lots close)
+    lot_exits       = None   # list of (exit_time, exit_price, reason) per lot
+
+    for i in range(1, n):
+        # Build extra dict from designated columns (HTF indicators etc.)
+        extra_data = {}
+        if extra_cols:
+            for col in extra_cols:
+                if col in df.columns:
+                    val = df[col].iloc[i]
+                    extra_data[col] = bool(val) if df[col].dtype == bool else float(val) if pd.notna(val) else 0.0
+
+        bar = BarData(
+            index     = i,
+            timestamp = times[i],
+            open      = opens[i],
+            high      = highs[i],
+            low       = lows[i],
+            close     = closes[i],
+            extra     = extra_data,
+        )
+
+        # ------------------------------------------------------------------
+        # Manage open position
+        # ------------------------------------------------------------------
+        if in_position:
+            # Update tracking
+            high_since = max(high_since, bar.high)
+            low_since  = min(low_since,  bar.low)
+            bars_held  = i - entry_bar
+
+            pos_state = PositionState(
+                side             = position_side,
+                entry_price      = entry_price,
+                entry_bar        = entry_bar,
+                entry_time       = entry_time,
+                bars_held        = bars_held,
+                lots_open        = list(lots_open),
+                lot_entry_prices = list(lot_entry_px),
+                high_since_entry = high_since,
+                low_since_entry  = low_since,
+                user_state       = user_state,
+            )
+
+            # Ask strategy what to do
+            decisions: list[LotExitDecision] = strategy.get_exit_decision(pos_state, bar)
+
+            # Sort by priority (stop=0 first, then targets, then runners)
+            decisions = sorted(decisions, key=lambda d: d.priority)
+
+            for decision in decisions:
+                k = decision.lot_index
+                if k < len(lots_open) and lots_open[k]:
+                    lots_open[k]   = False
+                    lot_exits[k]   = (bar.timestamp, decision.exit_price, decision.reason)
+
+                    # If stop (priority=0) exits any lot, close ALL remaining lots at same price
+                    if decision.priority == 0:
+                        for j in range(len(lots_open)):
+                            if lots_open[j]:
+                                lots_open[j] = False
+                                lot_exits[j] = (bar.timestamp, decision.exit_price, "stop_cascade")
+                        break  # all lots closed
+
+            # Check if fully flat
+            if not any(lots_open):
+                # Build trade record
+                raw_pnl = 0.0
+                last_exit_time = entry_time
+
+                row = {
+                    "entry_time":  entry_time,
+                    "entry_price": entry_price,
+                    "position":    position_side,
+                    "direction":   "LONG" if position_side > 0 else "SHORT",
+                }
+
+                for k, (ex_time, ex_price, ex_reason) in enumerate(lot_exits):
+                    size      = lot_configs[k]["size"] if k < len(lot_configs) else 1
+                    lot_pnl   = (ex_price - entry_price) * position_side * point_value * size
+                    raw_pnl  += lot_pnl
+                    row[f"lot{k+1}_exit_price"]  = ex_price
+                    row[f"lot{k+1}_exit_reason"] = ex_reason
+                    row[f"lot{k+1}_raw_pnl"]     = round(lot_pnl, 2)
+                    row[f"lot{k+1}_size"]         = size
+                    if ex_time > last_exit_time:
+                        last_exit_time = ex_time
+
+                total_lots = sum(lc["size"] for lc in lot_configs)
+                commission = commission_per_side * 2 * total_lots
+                net_pnl    = raw_pnl - commission
+
+                row["exit_time"]   = last_exit_time
+                row["exit_reason"] = lot_exits[0][2] if lot_exits else "unknown"
+                row["raw_pnl"]     = round(raw_pnl, 2)
+                row["commission"]  = round(commission, 2)
+                row["net_pnl"]     = round(net_pnl, 2)
+                row["duration_bars"] = i - entry_bar
+
+                trades.append(row)
+
+                # Reset
+                in_position   = False
+                position_side = 0
+                entry_bar     = None
+                entry_time    = None
+                entry_price   = None
+                lots_open     = None
+                lot_entry_px  = None
+                high_since    = None
+                low_since     = None
+                user_state    = {}
+                lot_exits     = None
+
+        # ------------------------------------------------------------------
+        # New entry if flat
+        # ------------------------------------------------------------------
+        if not in_position and sig[i] != 0:
+            position_side = int(sig[i])
+            entry_bar     = i
+            entry_time    = times[i]
+            entry_price   = opens[i]   # fill at bar open (next bar after signal)
+            lots_open     = [True] * n_lots
+            lot_entry_px  = [entry_price] * n_lots
+            high_since    = highs[i]
+            low_since     = lows[i]
+            user_state    = {}
+            lot_exits     = [(None, None, None)] * n_lots
+            in_position   = True
+
+    return pd.DataFrame(trades) if trades else pd.DataFrame()
+
+
 def calculate_metrics(trades: pd.DataFrame, df: pd.DataFrame) -> dict[str, Any]:
     if trades.empty:
         return {"error": "No trades generated"}

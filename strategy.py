@@ -89,6 +89,34 @@ class Strategy(ABC):
         """
         ...
 
+    def get_exit_decision(self, position, bar) -> list:
+        """
+        Called by the generic engine on every bar while in a position.
+
+        Args:
+            position: PositionState — current position state
+            bar:      BarData — current bar OHLCV + extra HTF data
+
+        Returns:
+            List of LotExitDecision objects. Empty list = hold all lots.
+            Stop exits should have priority=0 so they cascade to all lots.
+            Target/runner exits should have priority=1+.
+
+        Default implementation returns [] (hold) — override in strategies
+        that use the generic engine. Strategies using simulate_trades_fgbl
+        do NOT need to implement this.
+        """
+        return []
+
+    @property
+    def uses_generic_engine(self) -> bool:
+        """
+        Return True to route through simulate_trades_generic.
+        Default False = use legacy simulate_trades_fgbl.
+        Override in strategies that implement get_exit_decision().
+        """
+        return False
+
 
 # ---------------------------------------------------------------------------
 # EMA Crossover
