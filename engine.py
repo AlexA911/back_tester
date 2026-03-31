@@ -1261,7 +1261,13 @@ def simulate_trades_generic(
             for col in extra_cols:
                 if col in df.columns:
                     val = df[col].iloc[i]
-                    extra_data[col] = bool(val) if df[col].dtype == bool else float(val) if pd.notna(val) else 0.0
+                    # _entry_px must preserve NaN so engine falls back to bar open correctly
+                    if df[col].dtype == bool:
+                        extra_data[col] = bool(val)
+                    elif col == "_entry_px":
+                        extra_data[col] = float(val)  # preserve nan
+                    else:
+                        extra_data[col] = float(val) if pd.notna(val) else 0.0
 
         bar = BarData(
             index     = i,
@@ -1372,7 +1378,11 @@ def simulate_trades_generic(
             position_side = int(sig[i])
             entry_bar     = i
             entry_time    = times[i]
-            entry_price   = opens[i]   # fill at bar open (next bar after signal)
+            # Use pre-computed 1m-based entry price if strategy provided it.
+            # _entry_px is stored at signal bar i, shifted to fill bar i+1.
+            # bar.extra is populated from exec_df at current bar index i.
+            _ep = extra_data.get("_entry_px", float("nan"))
+            entry_price = float(_ep) if (_ep == _ep) else opens[i]  # nan check: nan != nan
             lots_open     = [True] * n_lots
             lot_entry_px  = [entry_price] * n_lots
             high_since    = highs[i]

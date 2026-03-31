@@ -235,10 +235,21 @@ def validate_trades(
             stop_px   = trade.get("stop_price")
             target_px = trade.get("target_price")
 
+        # For generic-engine strategies with shifted signals,
+        # signal bar = fill bar - signal_minutes (stored in params)
+        sig_minutes = params.get("signal_minutes", 0) if params else 0
+        if sig_minutes and sig_minutes > 0:
+            signal_bar_time = entry_time - pd.Timedelta(minutes=sig_minutes)
+            signal_info = f"  Signal: {signal_bar_time}"
+        else:
+            signal_info = ""
+
         print()
         print(f"  {'─' * 73}")
         print(f"  Trade {i:>3}  |  {direction.upper():<5}  |  "
               f"Entry: {entry_time}  →  Exit: {exit_time}  |  Reason: {exit_reason.upper()}")
+        if signal_info:
+            print(f"  {signal_info}  |  Fill bar: {entry_time}")
         print(f"  {'─' * 73}")
 
         # --- Setup debug (MomentumIgnition only) ---
@@ -314,11 +325,26 @@ def validate_trades(
             else:
                 fill_note = "(could not verify)"
         else:
-            bar_open   = exec_df.loc[entry_time, "open"] \
-                         if entry_time in exec_df.index else None
-            if bar_open is not None:
-                # Limit order logic: long fills if bar opened at or below limit,
-                # short fills if bar opened at or above limit
+            bar_open = exec_df.loc[entry_time, "open"]                        if entry_time in exec_df.index else None
+
+            # For strategies using 1m-based fills, also check vs 1m bar open
+            sig_min = params.get("signal_minutes", 0) if params else 0
+            if sig_min and sig_min > 0:
+                signal_bar_ts = entry_time - pd.Timedelta(minutes=sig_min)
+                fill_bar_1m_ts = signal_bar_ts + pd.Timedelta(minutes=sig_min)
+                if fill_bar_1m_ts in df_1m.index:
+                    expected_fill_base = float(df_1m.loc[fill_bar_1m_ts, "open"])
+                    tick = params.get("tick_size", 0.01) if params else 0.01
+                    slip = params.get("entry_slip_ticks", 1) * tick
+                    expected_fill = expected_fill_base + slip if direction == "long"                                     else expected_fill_base - slip
+                    fill_match = abs(entry_px - expected_fill) < tick * 0.5
+                    fill_note = (f"{'✓' if fill_match else '✗'} vs 1m open "
+                                 f"({expected_fill_base}) + {int(params.get('entry_slip_ticks',1))}t slip "
+                                 f"= {expected_fill:.3f}")
+                else:
+                    fill_match = True
+                    fill_note = f"(1m bar at {fill_bar_1m_ts} not found)"
+            elif bar_open is not None:
                 is_long_trade = direction == "long"
                 if is_long_trade:
                     fill_match = bar_open <= entry_px + 1e-6

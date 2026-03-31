@@ -253,9 +253,29 @@ class BrentPullback(Strategy):
                             "_slip_tgt", "_slip_flip"]
         self._exec_df    = m
 
-        # Shift signals forward by 1 bar: signal fires at close of bar i,
-        # we want to fill at open of bar i+1. The engine fills at opens[i]
-        # for sig[i] != 0, so shifting by 1 achieves fill at next bar open.
+        # --- Fill price: open of the first 1m bar after the 5m signal bar ---
+        # Signal fires at close of 5m bar at time T (bar label = bar open time).
+        # The 5m bar covers T to T+5min. The first tradeable 1m bar opens at T+5min.
+        # We look up df_1m.loc[T+5min, "open"] and store as _entry_px.
+        # The engine uses _entry_px when present instead of the exec_df bar open.
+        td5 = pd.Timedelta(minutes=5)
+        entry_prices = pd.Series(np.nan, index=m.index, dtype=float)
+        for idx_ts in m.index[signals != 0]:
+            fill_ts = idx_ts + td5
+            if fill_ts in df_1m.index:
+                raw_open = float(df_1m.at[fill_ts, "open"])
+                side     = int(signals.at[idx_ts])
+                slip_e   = tick * p["entry_slip_ticks"]
+                entry_prices.at[idx_ts] = raw_open + slip_e if side == 1 else raw_open - slip_e
+
+        # Shift _entry_px forward by 1 bar to align with the shifted signals.
+        # Signal at bar i → fill at bar i+1. _entry_px must be at bar i+1
+        # so the engine reads it from extra_data when processing the fill bar.
+        m["_entry_px"] = entry_prices.shift(1)
+        self._extra_cols = ["_atr", "_trend15", "_slip_stop",
+                            "_slip_tgt", "_slip_flip", "_entry_px"]
+
+        # Shift signals by 1 so the engine fires at open of next bar
         signals = signals.shift(1).fillna(0).astype(int)
 
         return {
