@@ -1269,6 +1269,16 @@ def print_grid_results(results: dict, assets: list[str], param_grid: dict) -> No
 # ---------------------------------------------------------------------------
 
 
+def _make_dataset(key: str, period_spec: dict | None = None) -> dict:
+    """Copy a dataset and apply any non-empty period overrides for this run."""
+    dataset = dict(DATASETS[key])
+    if period_spec:
+        for field in ("split_date", "period"):
+            if period_spec.get(field):
+                dataset[field] = period_spec[field]
+    return dataset
+
+
 def _offer_cross_split_run(current_split, assets, timeframe, params, base_config, timestamp, period_spec=None):
     """After a train run, offer to immediately run the same params on test (and vice versa)."""
     other_split = "test" if current_split == "train" else "train"
@@ -1292,18 +1302,8 @@ def _offer_cross_split_run(current_split, assets, timeframe, params, base_config
             print(f"  WARNING: Could not load {key} {other_split}: {e}")
             continue
 
-        def _make_dataset(k):
-            from backtester.config.datasets import DATASETS
-            ds = dict(DATASETS[k])
-            if period_spec:
-                if period_spec.get("split_date"):
-                    ds["split_date"] = period_spec["split_date"]
-                if period_spec.get("period"):
-                    ds["period"] = period_spec["period"]
-            return ds
-
         result = run_backtest(
-            dataset=_make_dataset(key),
+            dataset=_make_dataset(key, period_spec),
             strategy=STRATEGY_CLASS(params=params),
             split=other_split,
             trade_size=sum(int(params.get(f"lot{k}_size", 0)) for k in range(1, 4)
@@ -1365,15 +1365,6 @@ def main():
     # Determine effective split for train/test logic
     # custom/named modes behave like "train" for single-period runs
     _base_split = split if split in ("train", "test", "both") else "train"
-
-    def _make_dataset(key: str) -> dict:
-        """Inject period_spec into dataset dict for this run."""
-        ds = dict(DATASETS[key])
-        if period_spec.get("split_date"):
-            ds["split_date"] = period_spec["split_date"]
-        if period_spec.get("period"):
-            ds["period"] = period_spec["period"]
-        return ds
 
     # Shared config dict — passed to exporter for run_config.txt
     base_config = {
@@ -1460,7 +1451,7 @@ def main():
         results = {}
         for key in assets:
             results[key] = run_backtest(
-                dataset=_make_dataset(key),
+                dataset=_make_dataset(key, period_spec),
                 strategy=STRATEGY_CLASS(params=params),
                 split=_base_split,
                 trade_size=effective_trade_size,
@@ -1504,7 +1495,7 @@ def main():
 
         # For "both": always run grid on train, then validate top 3 on test
         train_split = "train" if split == "both" else split
-        _ds_override = {k: _make_dataset(k) for k in assets}
+        _ds_override = {k: _make_dataset(k, period_spec) for k in assets}
         print_run_header(assets, period_spec.get("label", train_split), timeframe, mode, param_grid)
 
         results = run_grid_search(
