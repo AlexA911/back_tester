@@ -25,3 +25,7 @@ tests/synthetic_*.csv
 .env
 .env.*
 !.env.example
+
+# Full dataset csv's
+data/dataset/
+
