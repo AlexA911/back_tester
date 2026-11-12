@@ -34,7 +34,8 @@ import pandas as pd
 
 from backtester.config.datasets import DATASETS
 from backtester.core.backtest import run_backtest
-from backtester.core.cache_manager import load_cached, load_raw, get_split_date, load_resampled_cache
+from backtester.core.cache_manager import get_split_date, load_resampled_cache
+from backtester.core.data_loader import load_dataset
 from backtester.strategies.base import Strategy
 
 
@@ -234,51 +235,9 @@ def run_grid_search(
             continue
 
         try:
-            from pathlib import Path as _Path
-            period = dataset.get("period")
-
-            if full_path and _Path(full_path).exists():
-                # Full CSV available — use cache (auto-build on first run)
-                # build_cache writes split_date to index synchronously,
-                # so get_split_date is always valid after this call returns
-                df = load_cached(
-                    symbol=key,
-                    timeframe=1,
-                    raw_path=full_path,
-                    date_format=dataset["date_format"],
-                    auto_build=True,
-                    verbose=True,
-                )
-                # Apply date filter — split_date now guaranteed in index
-                if period is not None:
-                    from_date, to_date = period
-                    if from_date:
-                        df = df[df.index >= pd.Timestamp(from_date)]
-                    if to_date:
-                        df = df[df.index <= pd.Timestamp(to_date)]
-                elif split in ("train", "test"):
-                    split_date = dataset.get("split_date") or get_split_date(key)
-                    if split_date:
-                        if split == "train":
-                            df = df[df.index < pd.Timestamp(split_date)]
-                        else:
-                            df = df[df.index >= pd.Timestamp(split_date)]
-                    else:
-                        # Should never happen — build_cache always stores split_date
-                        raise RuntimeError(f"No split_date for {key} after cache build")
-            else:
-                # No full CSV — fall back to split-specific CSV (original behaviour)
-                # train CSV = train data, test CSV = test data — always correct
-                if period is not None:
-                    load_path = raw_path
-                    df = load_raw(load_path, dataset["date_format"])
-                    from_date, to_date = period
-                    if from_date:
-                        df = df[df.index >= pd.Timestamp(from_date)]
-                    if to_date:
-                        df = df[df.index <= pd.Timestamp(to_date)]
-                else:
-                    df = load_raw(raw_path, dataset["date_format"])
+            df = load_dataset(
+                dataset, split, symbol=key, verbose=True, require_split_date=True,
+            )
 
             # If strategy has a fixed signal timeframe, pre-resample and cache
             # FGBLMomentum always uses 120m signal bars with 15min offset

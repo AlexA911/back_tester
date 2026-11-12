@@ -23,7 +23,8 @@ import pandas as pd
 from backtester.strategies.base import Strategy
 from backtester.core.engine import simulate_trades, simulate_trades_multilot, simulate_trades_fgbl, simulate_trades_generic, calculate_metrics
 from backtester.core.resampler import resample_ohlcv
-from backtester.core.cache_manager import load_cached, load_raw, get_split_date
+from backtester.core.cache_manager import load_raw
+from backtester.core.data_loader import load_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -70,9 +71,6 @@ def run_backtest(
         return {"symbol": symbol, "split": split,
                 "error": f"Missing tick specs for {symbol}"}
 
-    date_format = dataset["date_format"]
-    period      = dataset.get("period")       # (from_date, to_date) or None
-
     # --- Determine data source ---
     # Prefer full-history cache; fall back to split-specific CSVs
     full_path = dataset.get("full")
@@ -85,45 +83,7 @@ def run_backtest(
         return {"symbol": symbol, "split": split,
                 "error": f"File not found: {raw_path}"}
 
-    # --- Load 1m data ---
-    # If full CSV exists: use cache (auto-build on first run, fast thereafter).
-    # build_cache writes split_date synchronously, so filter is always correct.
-    # If no full CSV: fall back to split-specific CSV (original behaviour).
-    if full_path and Path(full_path).exists():
-        df_1m = load_cached(
-            symbol=symbol,
-            timeframe=1,
-            raw_path=full_path,
-            date_format=date_format,
-            auto_build=True,
-            verbose=False,
-        )
-        # Apply filter — split_date guaranteed in index after load_cached returns
-        if period is not None:
-            from_date, to_date = period
-            if from_date:
-                df_1m = df_1m[df_1m.index >= pd.Timestamp(from_date)]
-            if to_date:
-                df_1m = df_1m[df_1m.index <= pd.Timestamp(to_date)]
-        elif split in ("train", "test"):
-            split_date = dataset.get("split_date") or get_split_date(symbol)
-            if split_date:
-                if split == "train":
-                    df_1m = df_1m[df_1m.index < pd.Timestamp(split_date)]
-                else:
-                    df_1m = df_1m[df_1m.index >= pd.Timestamp(split_date)]
-    else:
-        # No full CSV — load split-specific CSV directly (original behaviour)
-        if period is not None:
-            load_path = raw_path
-            df_1m = load_raw(load_path, date_format)
-            from_date, to_date = period
-            if from_date:
-                df_1m = df_1m[df_1m.index >= pd.Timestamp(from_date)]
-            if to_date:
-                df_1m = df_1m[df_1m.index <= pd.Timestamp(to_date)]
-        else:
-            df_1m = load_raw(raw_path, date_format)
+    df_1m = load_dataset(dataset, split, symbol=symbol)
 
     if len(df_1m) == 0:
         return {"symbol": symbol, "split": split,
