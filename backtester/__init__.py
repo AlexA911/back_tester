@@ -1,0 +1,2 @@
+# Directory refactor
+"""Backtester application."""

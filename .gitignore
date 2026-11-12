@@ -1,0 +1,27 @@
+# Directory refactor
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+data/cache/
+
+# Generated output and local cache metadata
+results/
+data/cache_index.json
+
+# Test caches, coverage, and temporary files
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+tests/tmp*/
+tests/synthetic_*.csv
+*.tmp
+*.log
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
